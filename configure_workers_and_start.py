@@ -109,7 +109,7 @@ WORKERS_CONFIG: Dict[str, Dict[str, Any]] = {
     },
     "media_repository": {
         "app": "synapse.app.media_repository",
-        "listener_resources": ["client","media"],
+        "listener_resources": ["client","federation"],
         "endpoint_patterns": [
             "^/_matrix/media/",
             "^/_synapse/admin/v1/purge_media_cache$",
