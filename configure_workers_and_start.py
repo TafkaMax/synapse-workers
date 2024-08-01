@@ -110,6 +110,7 @@ WORKERS_CONFIG: Dict[str, Dict[str, Any]] = {
     "media_repository": {
         "app": "synapse.app.generic_worker",
         "listener_resources": ["media","client","federation"],
+        "single_listener": True,
         "endpoint_patterns": [
             "^/_matrix/media/",
             "^/_synapse/admin/v1/purge_media_cache$",
@@ -375,6 +376,7 @@ class Worker:
     shared_extra_config: Dict[str, Any]
     worker_extra_conf: str
     types_list: List[str]
+    single_listener: bool
 
     def extract_jinja_worker_template(self) -> Dict[str, Any]:
         config: Dict[str, Any] = {}
@@ -468,6 +470,10 @@ class Worker:
             if worker_extra_conf:
                 # Copy it, in case it takes it as a reference.
                 self.worker_extra_conf = worker_extra_conf
+
+            single_listener = worker_config.get("single_listener")
+            if single_listener:
+                self.single_listener = True
 
 
 class Workers:
