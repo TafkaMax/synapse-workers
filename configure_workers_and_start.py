@@ -108,24 +108,18 @@ WORKERS_CONFIG: Dict[str, Dict[str, Any]] = {
         "worker_extra_conf": "",
     },
     "media_repository": {
-        "app": "synapse.app.media_repository",
-        "listener_resources": ["media"],
+        "app": "synapse.app.generic_worker",
+        "listener_resources": ["client"],
         "endpoint_patterns": [
             "^/_matrix/media/",
-            "^/_matrix/client/v1/media/.*$",
-            #"^/_matrix/client/v1/media/download/.*$",
-            #"^/_matrix/client/v1/media/download/.*$",
-            #"^/_matrix/client/v1/media/thumbnail/.*$",
-            #"^/_matrix/client/v1/media/config",
-            #"^/_matrix/client/v1/media/preview_url",
-            #"^/_matrix/federation/v1/media/download/.*$",
-            #"^/_matrix/federation/v1/media/thumbnail/.*$",
             "^/_synapse/admin/v1/purge_media_cache$",
             "^/_synapse/admin/v1/room/.*/media.*$",
             "^/_synapse/admin/v1/user/.*/media.*$",
             "^/_synapse/admin/v1/users/.*/media.*$",
             "^/_synapse/admin/v1/media/.*$",
             "^/_synapse/admin/v1/room/.*/media/quarantine$",
+            "^/_matrix/client/v1/media/.*$",
+            "^/_matrix/federation/v1/media/.*$",
         ],
         # The first configured media worker will run the media background jobs
         "shared_extra_conf": {
