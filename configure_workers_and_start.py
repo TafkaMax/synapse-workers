@@ -24,7 +24,10 @@
 #         the end to multiply that worker. Append multiple worker types with '+' to
 #         merge the worker types into a single worker. Add a name and a '=' to the
 #         front of a worker type to give this instance a name in logs and nginx.
-#         Examples:
+#         Observe `shorthand_worker_combos` below to see historically opinionated
+#         worker types and how they are now broken into subtypes. Worker types that
+#         work best by being routed to their respective endpoints are a best effort
+#         affair. Examples:
 #         SYNAPSE_WORKER_TYPES='event_persister, federation_sender, client_reader'
 #         SYNAPSE_WORKER_TYPES='event_persister:2, federation_sender:2, client_reader'
 #         SYNAPSE_WORKER_TYPES='stream_writers=account_data+presence+typing'
@@ -46,6 +49,7 @@
 # functionality should continue to work if so.
 
 import codecs
+import json
 import os
 import platform
 import re
@@ -62,8 +66,6 @@ import yaml
 from jinja2 import Environment, FileSystemLoader
 
 DEBUG = True
-if DEBUG is True:
-    import json
 
 MAIN_PROCESS_HTTP_LISTENER_PORT = 8008
 MAIN_PROCESS_HTTP_FED_LISTENER_PORT = 8448
@@ -80,6 +82,7 @@ MAIN_PROCESS_NEW_METRICS_UNIX_SOCKET_PATH = "/run/main_metrics.sock"
 enable_compressor = False
 enable_coturn = False
 enable_prometheus = False
+enable_metric_endpoints = False
 enable_redis_exporter = False
 enable_postgres_exporter = False
 
@@ -90,6 +93,7 @@ enable_postgres_exporter = False
 # Watching /_matrix/media and related needs a "media" listener
 # Stream Writers require "client" and "replication" listeners because they
 #   have to attach by instance_map to the master process and have client endpoints.
+# Observe below `shorthand_worker_combos` for relevant combinations of worker roles
 WORKERS_CONFIG: Dict[str, Dict[str, Any]] = {
     "pusher": {
         "app": "synapse.app.generic_worker",
@@ -109,8 +113,7 @@ WORKERS_CONFIG: Dict[str, Dict[str, Any]] = {
     },
     "media_repository": {
         "app": "synapse.app.generic_worker",
-        "listener_resources": ["media","client","federation"],
-        "single_listener": True,
+        "listener_resources": ["client", "federation", "media"],
         "endpoint_patterns": [
             "^/_matrix/media/",
             "^/_synapse/admin/v1/purge_media_cache$",
@@ -147,7 +150,7 @@ WORKERS_CONFIG: Dict[str, Dict[str, Any]] = {
         "app": "synapse.app.generic_worker",
         "listener_resources": ["client"],
         "endpoint_patterns": [
-            "^/_matrix/client/(r0|v3|unstable)/sync$",
+            "^/_matrix/client/(r0|v3)/sync$",
             "^/_matrix/client/(api/v1|r0|v3)/events$",
             "^/_matrix/client/(api/v1|r0|v3)/initialSync$",
             "^/_matrix/client/(api/v1|r0|v3)/rooms/[^/]+/initialSync$",
@@ -155,18 +158,23 @@ WORKERS_CONFIG: Dict[str, Dict[str, Any]] = {
         "shared_extra_conf": {},
         "worker_extra_conf": "",
     },
-    "client_reader": {
+    "sliding_synchrotron": {
+        "app": "synapse.app.generic_worker",
+        "listener_resources": ["client"],
+        "endpoint_patterns": [
+            # I'm not sure if this will be v4 or v5 when it's done. Classic sync is V2
+            # but is registered on v3 above. Sync V3 was MSC3575 and was recently closed
+            # in favor of MSC4186, however this endpoint uses the MSC3575 unstable endpoint
+            "^/_matrix/client/unstable/.*/sync$",
+        ],
+        "shared_extra_conf": {},
+        "worker_extra_conf": "",
+    },
+    "client_reader_non_room": {
         "app": "synapse.app.generic_worker",
         "listener_resources": ["client"],
         "endpoint_patterns": [
             "^/_matrix/client/(api/v1|r0|v3|unstable)/publicRooms$",
-            "^/_matrix/client/(api/v1|r0|v3|unstable)/rooms/.*/joined_members$",
-            "^/_matrix/client/(api/v1|r0|v3|unstable)/rooms/.*/context/.*$",
-            "^/_matrix/client/(api/v1|r0|v3|unstable)/rooms/.*/members$",
-            "^/_matrix/client/(api/v1|r0|v3|unstable)/rooms/.*/state$",
-            "^/_matrix/client/v1/rooms/.*/hierarchy$",
-            "^/_matrix/client/(v1|unstable)/rooms/.*/relations/",
-            "^/_matrix/client/v1/rooms/.*/threads$",
             "^/_matrix/client/(api/v1|r0|v3|unstable)/login$",
             "^/_matrix/client/(r0|v3|unstable)/account/3pid$",
             "^/_matrix/client/(r0|v3|unstable)/account/whoami$",
@@ -175,43 +183,79 @@ WORKERS_CONFIG: Dict[str, Dict[str, Any]] = {
             "^/_matrix/client/(api/v1|r0|v3|unstable)/register$",
             "^/_matrix/client/(api/v1|r0|v3|unstable)/register/available$",
             "^/_matrix/client/(r0|v3|unstable)/auth/.*/fallback/web$",
-            # This one needs to be routed by the .* cuz that's the room name.
-            "^/_matrix/client/(api/v1|r0|v3|unstable)/rooms/.*/messages$",
-            "^/_matrix/client/(api/v1|r0|v3|unstable)/rooms/.*/event",
             "^/_matrix/client/(api/v1|r0|v3|unstable)/joined_rooms",
-            "^/_matrix/client/(api/v1|r0|v3|unstable/.*)/rooms/.*/aliases",
-            "^/_matrix/client/v1/rooms/.*/timestamp_to_event$",
             "^/_matrix/client/(api/v1|r0|v3|unstable)/search",
             "^/_matrix/client/(r0|v3|unstable)/password_policy$",
-            "^/_matrix/client/(api/v1|r0|v3|unstable)/directory/room.*$",
             "^/_matrix/client/(r0|v3|unstable)/capabilities$",
         ],
         "shared_extra_conf": {},
         "worker_extra_conf": "",
     },
-    "federation_reader": {
+    "client_reader_room": {
+        "app": "synapse.app.generic_worker",
+        "listener_resources": ["client"],
+        "endpoint_patterns": [
+            "^/_matrix/client/(api/v1|r0|v3|unstable)/rooms/.*/joined_members$",
+            "^/_matrix/client/(api/v1|r0|v3|unstable)/rooms/.*/context/.*$",
+            "^/_matrix/client/(api/v1|r0|v3|unstable)/rooms/.*/members$",
+            "^/_matrix/client/(api/v1|r0|v3|unstable)/rooms/.*/state$",
+            "^/_matrix/client/v1/rooms/.*/hierarchy$",
+            "^/_matrix/client/(v1|unstable)/rooms/.*/relations/",
+            "^/_matrix/client/v1/rooms/.*/threads$",
+            "^/_matrix/client/(api/v1|r0|v3|unstable)/rooms/.*/messages$",
+            "^/_matrix/client/(api/v1|r0|v3|unstable)/rooms/.*/event",
+            "^/_matrix/client/(api/v1|r0|v3|unstable/.*)/rooms/.*/aliases",
+            "^/_matrix/client/v1/rooms/.*/timestamp_to_event$",
+            # This one does not work on workers yet, I believe this is because of faster joins
+            # "^/_matrix/client/(api/v1|r0|v3|unstable)/directory/list/room.*$",
+            "^/_matrix/client/(api/v1|r0|v3|unstable)/directory/room.*$",
+        ],
+        "shared_extra_conf": {},
+        "worker_extra_conf": "",
+    },
+    "federation_reader_non_room": {
         "app": "synapse.app.generic_worker",
         "listener_resources": ["federation"],
         "endpoint_patterns": [
             "^/_matrix/federation/(v1|v2)/event/",
+            "^/_matrix/federation/(v1|v2)/publicRooms",
+            "^/_matrix/federation/(v1|v2)/query/",
+            "^/_matrix/federation/(v1|v2)/query_auth/",
+            "^/_matrix/federation/(v1|v2)/user/devices/",
+            # I found no reference to this in the docs, I think it was removed
+            # "^/_matrix/federation/(v1|v2)/get_groups_publicised$",
+            # These two should probably be moved to the frontend_proxy
+            # "^/_matrix/key/v2/server",
+            "^/_matrix/key/v2/query",
+            "^/_matrix/federation/v1/hierarchy/.*$",
+            # These are disabled because they need to be verified to work on
+            # the worker model in Synapse.
+            # "^/_matrix/federation/v1/user/keys/claim$",
+            # "^/_matrix/federation/v1/user/keys/query$",
+
+        ],
+        "shared_extra_conf": {},
+        "worker_extra_conf": "",
+    },
+    "federation_reader_room": {
+        "app": "synapse.app.generic_worker",
+        "listener_resources": ["federation"],
+        "endpoint_patterns": [
             "^/_matrix/federation/(v1|v2)/state/",
             "^/_matrix/federation/(v1|v2)/state_ids/",
             "^/_matrix/federation/(v1|v2)/backfill/",
             "^/_matrix/federation/(v1|v2)/get_missing_events/",
-            "^/_matrix/federation/(v1|v2)/publicRooms",
-            "^/_matrix/federation/(v1|v2)/query/",
             "^/_matrix/federation/(v1|v2)/make_join/",
+            "^/_matrix/federation/(v1|v2)/make_knock/",
             "^/_matrix/federation/(v1|v2)/make_leave/",
             "^/_matrix/federation/(v1|v2)/send_join/",
+            "^/_matrix/federation/(v1|v2)/send_knock/",
             "^/_matrix/federation/(v1|v2)/send_leave/",
             "^/_matrix/federation/(v1|v2)/invite/",
             "^/_matrix/federation/(v1|v2)/query_auth/",
             "^/_matrix/federation/(v1|v2)/event_auth/",
             "^/_matrix/federation/v1/timestamp_to_event/",
             "^/_matrix/federation/(v1|v2)/exchange_third_party_invite/",
-            "^/_matrix/federation/(v1|v2)/user/devices/",
-            "^/_matrix/federation/(v1|v2)/get_groups_publicised$",
-            "^/_matrix/key/v2/query",
         ],
         "shared_extra_conf": {},
         "worker_extra_conf": "",
@@ -307,19 +351,11 @@ WORKERS_CONFIG: Dict[str, Dict[str, Any]] = {
     },
 }
 
-HTTP_BASED_LISTENER_RESOURCES = [
-    "health",
-    "client",
-    "federation",
-    "media",
-    "replication",
-]
-
 # Templates for sections that may be inserted multiple times in config files
 NGINX_LOCATION_CONFIG_BLOCK = """
     location ~* {endpoint} {{
         proxy_pass {upstream};
-        proxy_set_header X-Forwarded-For $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
         proxy_set_header X-Forwarded-Proto $scheme;
         proxy_set_header Host $host;
 {additional_location_body}
@@ -334,13 +370,17 @@ upstream {upstream_name} {{
 }}
 """
 
-PROMETHEUS_SCRAPE_CONFIG_BLOCK = """
-    - targets: ["{metrics_target}"]
-      labels:
-        instance: "Synapse"
-        job: "{name}"
-        index: {index}
-"""
+
+ROLES_LB_HEADER_LIST = ["synchrotron"]
+ROLES_LB_IP_LIST = ["federation_inbound"]
+ROLES_LB_ROOM_NAME: List[str] = ["client_reader_room", "federation_reader_room"]
+
+shorthand_worker_combos = {
+    "client_reader": "client_reader_room+client_reader_non_room",
+    "federation_reader": "federation_reader_room+federation_reader_non_room",
+    "room_reader": "federation_reader_room+client_reader_room",
+    "general_reader": "client_reader_non_room+federation_reader_non_room",
+}
 
 
 class Worker:
@@ -354,11 +394,12 @@ class Worker:
         app: 'synapse.app.generic_worker' for all now
         listener_resources: Set of types of listeners needed. 'client, federation,
             replication, media' etc.
-        listener_port_map: Dict of 'listener':port_number so 'client':18900
-        endpoint_patterns: Dict of listener resource containing url endpoints this
-            worker accepts connections on. Because a worker can merge multiple roles
-            with potentially different listeners, this is important. e.g.
-            {'client':{'/url1','/url2'}}
+        main_port: The main port number for most primary listeners('client', 'federation', etc)
+        health_port: The port number for the /health endpoint
+        manhole_port: The port number for ssh-ing into a running synapse. Will not be a Unix socket
+        metrics_port: The port number for the metrics endpoints
+        replication_port: The port number for replication, if needed
+        endpoint_patterns: Set of url endpoints this worker watches. e.g. {'/url1','/url2'}
         shared_extra_config: Dict of one-offs that enable special roles for specific
             workers. Ends up in shared.yaml
         worker_extra_conf: Only used by media_repository to enable that functionality.
@@ -371,8 +412,12 @@ class Worker:
     index: int
     app: str
     listener_resources: Set[str]
-    listener_port_map: Dict[str, int]
-    endpoint_patterns: Dict[str, Set[str]]
+    main_port: int
+    health_port: int
+    manhole_port: int
+    metrics_port: int
+    replication_port: int
+    endpoint_patterns: Set[str]
     shared_extra_config: Dict[str, Any]
     worker_extra_conf: str
     types_list: List[str]
@@ -400,9 +445,13 @@ class Worker:
                     fulfill.
         """
         self.listener_resources = set()
-        self.endpoint_patterns = defaultdict(set[str])
+        self.endpoint_patterns = set()
         self.shared_extra_config = {}
-        self.listener_port_map = defaultdict(int)
+        self.main_port = 0
+        self.health_port = 0
+        self.manhole_port = 0
+        self.metrics_port = 0
+        self.replication_port = 0
         self.types_list = []
         self.worker_extra_conf = ""
         self.base_name = ""
@@ -414,13 +463,29 @@ class Worker:
         self.base_name = name
 
         # Split the worker types from string into list. This will have already been
-        # stripped of the potential name and multiplier. Check for duplicates in the
-        # split worker type list. No advantage in having duplicated worker types on
-        # the same worker. Two would consolidate into one. (e.g. "pusher + pusher"
-        # would resolve to a single "pusher" which may not be what was intended.)
+        # stripped of the potential name and multiplier. Allow for duplicate subtypes in the
+        # list so that two shorthand workers can have merged functionality
         self.types_list = split_and_strip_string(worker_type_str, "+")
-        if len(self.types_list) != len(set(self.types_list)):
-            error(f"Duplicate worker type found in '{worker_type_str}'! Please fix.")
+
+        # Check that the worker type requested isn't one of the special shorthand
+        # types, such as 'client_reader'. This should be a recursive check, to handle
+        # combined worker types containing one of the shorthand
+        while True:
+            if not any([roles for roles in self.types_list if "+" in roles or roles in shorthand_worker_combos]):
+                break
+            else:
+                for role in self.types_list:
+                    new_roles = None
+                    if role in shorthand_worker_combos:
+                        new_role = shorthand_worker_combos[role]
+                        new_roles = split_and_strip_string(new_role, "+")
+
+                    if "+" in role:
+                        new_roles = split_and_strip_string(role, "+")
+
+                    if new_roles:
+                        self.types_list.remove(role)
+                        self.types_list.extend(new_roles)
 
         for role in self.types_list:
             worker_config = WORKERS_CONFIG.get(role)
@@ -437,26 +502,12 @@ class Worker:
             self.app = str(worker_config.get("app"))
 
             # Get the listener_resources
-            listener_resources = worker_config.get("listener_resources")
+            listener_resources = worker_config.get("listener_resources", [])
             if listener_resources:
                 self.listener_resources.update(listener_resources)
 
-            # Get the endpoint_patterns, add them to a set and assign to a dict key
-            # of listener_resource. Since any given worker role has exactly one
-            # external connection resource, figure out which one it is and use that
-            # as a key to identify the endpoint pattern to be assigned to it. This
-            # allows different resources to be split onto different ports and then
-            # merged with similar resources when worker roles are merged together.
-            lr: str = ""
-            for this_resource in listener_resources:
-                # Only look for these three, as endpoints shouldn't be assigned to
-                # something like a 'health' or 'replication' listener.
-                if this_resource in ["client", "federation", "media"]:
-                    lr = this_resource
-            endpoint_patterns = worker_config.get("endpoint_patterns")
-            if endpoint_patterns:
-                for endpoint in endpoint_patterns:
-                    self.endpoint_patterns[lr].add(endpoint)
+            endpoint_patterns = worker_config.get("endpoint_patterns", [])
+            self.endpoint_patterns.update(endpoint_patterns)
 
             # Get shared_extra_conf, if any
             shared_extra_config = worker_config.get("shared_extra_conf")
@@ -637,23 +688,146 @@ class Workers:
                 pass
         self.worker[worker_name].shared_extra_config = dict_to_edit
 
-    def set_listener_port_by_resource(
-        self, worker_name: str, resource_name: str
-    ) -> None:
+    def get_next_port_number(self) -> int:
         """
-        Simple helper to add to the listener_port_map and increment the counter of port
-        numbers. Will be borrowing the serialized incrementation for Unix Sockets also.
+        Increment and return the port number counter. This will initially create a gap
+        at the beginning at the sequence as one number gets skipped over. Ignore it as
+        annoying but not world-breaking
 
-        Args:
-            worker_name: Name of worker
-            resource_name: The listener resource this is for. e.g. 'client' or 'media'
+        Returns: int of the next port number to assign
 
         """
-        self.worker[worker_name].listener_port_map[
-            resource_name
-        ] = self.current_port_counter
-        # Increment the counter
         self.current_port_counter += 1
+        return self.current_port_counter
+
+
+def add_hash_to_body_if_need_load_balance(
+    roles_list: Set[str], counter_for_hash_map: int
+) -> str:
+    # This presents a dilemma. Some endpoints are better load-balanced by
+    # Authorization header, and some by remote IP. What do you do if a combo
+    # worker was requested that has endpoints for both? As it is likely but
+    # not impossible that a user will be on the same IP if they have multiple
+    # devices(like at home on Wi-Fi), I believe that balancing by IP would be
+    # the broader reaching choice. This is probably only slightly better than
+    # round-robin. As such, leave balancing by remote IP as the first of the
+    # conditionals below, so if both would apply the first is used.
+
+    # Three additional notes:
+    #   1. Federation endpoints shouldn't (necessarily) have Authorization
+    #       headers, so using them on these endpoints would be a moot point.
+    #   2. For Complement, this situation is reversed as there is only ever a
+    #       single IP used during tests, 127.0.0.1.
+    #   3. IIRC, it may be possible to hash by both at once, or at least have
+    #       both hashes on the same line. If I understand that correctly, the
+    #       one that doesn't exist is effectively ignored. However, that
+    #       requires increasing the hashmap size in the nginx master config
+    #       file, which would take more jinja templating(or at least a 'sed'),
+    #       and may not be accepted upstream. Based on previous experiments,
+    #       increasing this value was required for hashing by room id, so may
+    #       end up being a path forward anyway.
+
+    # Some endpoints should be load-balanced by client IP. This way,
+    # if it comes from the same IP, it goes to the same worker and should be
+    # a smarter way to cache data. This works well for federation.
+    if any(x in ROLES_LB_IP_LIST for x in roles_list):
+        counter_for_hash_map += 1
+        return "    hash $proxy_add_x_forwarded_for;\n"
+
+    # Some endpoints should be load-balanced by Authorization header. This
+    # means that even with a different IP, a user should get the same data
+    # from the same upstream source, like a synchrotron worker, with smarter
+    # caching of data.
+    elif any(x in ROLES_LB_HEADER_LIST for x in roles_list):
+        counter_for_hash_map += 1
+        return "    hash $user_id consistent;\n"
+
+    # Some endpoints cache better when the request uri with a room name is
+    # consistently mapped to the same worker. A `map` has been placed inside
+    # synapse-nginx.conf.j2 that this will reference. If all of the worker
+    # roles are not in the same LB block, then just round-robin the lot.
+    # Otherwise any path that does not match for a room name will just
+    # end up on the first upstream in the block, effectively pinning one
+    # worker unfairly
+    elif all(x in ROLES_LB_ROOM_NAME for x in roles_list):
+        counter_for_hash_map += 1
+        return "    hash $room_name consistent;\n"
+
+    else:
+        return ""
+
+
+class PromConfig:
+    """
+    Class to hold the data for configuring prometheus. These are all set to
+    default values. See the Prometheus docs on configuration for up-to-date
+    descriptions.
+    https://prometheus.io/docs/prometheus/latest/configuration/configuration
+
+    Attributes starting with 'rw_' are for remote write
+
+    Attributes:
+        instance_name: The name to pre-pend to this instance. For example, "Synapse" would then
+            make the redis exported data have an instance of "Synapse-Redis"
+        storage_retention_time:
+        rw_url_path:
+        rw_capacity:
+        rw_max_samples_per_send:
+        rw_min_shards:
+        rw_max_shards:
+        rw_protobuf_message: This is complicated and isn't used
+        rw_remote_timeout:
+        rw_headers: Looks like this needs to be a list of key:value pairs. Isn't used
+        rw_send_exemplars:
+        rw_name: Used to label the remote write config. Isn't used(No defaults)
+        rw_send_native_histograms:
+        file_sd_targets_file:
+    """
+    instance_name: str = "Synapse"
+    storage_retention_time = "1y"
+    rw_url_path: Optional[str] = None
+    rw_capacity: str = "10000"
+    rw_max_samples_per_send: str = "2000"
+    rw_min_shards: str = "1"
+    rw_max_shards: str = "50"
+    rw_batch_send_deadline: str = "5s"
+    rw_min_backoff: str = "30ms"
+    rw_max_backoff: str = "5s"
+    rw_retry_on_http_429: bool = False
+    rw_sample_age_limit: str = "0s"
+
+    rw_remote_timeout: str = "30s"
+    rw_send_exemplars: bool = False
+    rw_send_native_histograms: bool = False
+    rw_round_robin_dns: bool = False
+    file_sd_targets_file: str = ""
+
+    def __init__(self) -> None:
+        self.instance_name = os.environ.get("PROMETHEUS_INSTANCE_NAME", self.instance_name)
+        self.storage_retention_time = os.environ.get("PROMETHEUS_STORAGE_RETENTION_TIME", self.storage_retention_time)
+        self.rw_url_path = os.environ.get("PROMETHEUS_REMOTE_WRITE_HTTP_URL", None)
+        self.rw_capacity = os.environ.get("PROMETHEUS_REMOTE_WRITE_CAPACITY", self.rw_capacity)
+        self.rw_max_samples_per_send = os.environ.get(
+            "PROMETHEUS_REMOTE_WRITE_MAX_SAMPLES_PER_SEND", self.rw_max_samples_per_send
+        )
+        self.rw_min_shards = os.environ.get("PROMETHEUS_REMOTE_WRITE_MIN_SHARDS", self.rw_min_shards)
+        self.rw_max_shards = os.environ.get("PROMETHEUS_REMOTE_WRITE_MAX_SHARDS", self.rw_max_shards)
+        self.rw_batch_send_deadline = os.environ.get(
+            "PROMETHEUS_REMOTE_WRITE_BATCH_SEND_DEADLINE", self.rw_batch_send_deadline
+        )
+        self.rw_min_backoff = os.environ.get("PROMETHEUS_REMOTE_WRITE_MIN_BACKOFF", self.rw_min_backoff)
+        self.rw_max_backoff = os.environ.get("PROMETHEUS_REMOTE_WRITE_MAX_BACKOFF", self.rw_max_backoff)
+        self.rw_retry_on_http_429 = os.environ.get(
+            "PROMETHEUS_REMOTE_WRITE_RETRY_ON_HTTP_429", self.rw_retry_on_http_429
+        )
+        self.rw_sample_age_limit = os.environ.get("PROMETHEUS_REMOTE_WRITE_SAMPLE_AGE_LIMIT", self.rw_sample_age_limit)
+
+        self.rw_remote_timeout = os.environ.get("PROMETHEUS_REMOTE_WRITE_REMOTE_TIMEOUT", self.rw_remote_timeout)
+        self.rw_send_exemplars = os.environ.get("PROMETHEUS_REMOTE_WRITE_SEND_EXEMPLARS", self.rw_send_exemplars)
+        self.rw_send_native_histograms = os.environ.get(
+            "PROMETHEUS_REMOTE_WRITE_SEND_NATIVE_HISTOGRAMS", self.rw_send_native_histograms
+        )
+        self.rw_round_robin_dns = os.environ.get("PROMETHEUS_REMOTE_WRITE_ROUND_ROBIN_DNS", self.rw_round_robin_dns)
 
 
 class NginxConfig:
@@ -748,35 +922,21 @@ class NginxConfig:
         #    e.g. {1234: "worker_base_name"}
         port_to_upstream_name: Dict[int, str] = {}
 
-        # port_to_listener_type: A map of port to worker's listener_type. Functionally,
-        #    not important, but used to append to the upstream name so visually can
-        #    identify what type of listener it's pointing to.
-        #    e.g. { 1234: "client" }
-        port_to_listener_type: Dict[int, str] = {}
-
         # Add nginx location blocks for this worker's endpoints (if any are defined)
-        # There are now the capability of having multiple types of listeners.
         # Inappropriate types of listeners were already filtered out.
         for worker in workers.worker.values():
-            for listener_type, patterns in worker.endpoint_patterns.items():
-                for pattern in patterns:
-                    # Collect port numbers for this endpoint pattern
-                    locations_to_port_set.setdefault(pattern, set()).add(
-                        worker.listener_port_map[listener_type]
-                    )
-                # Set lookup maps to be used for combining upstreams in a moment.
-                # Need the worker's base name
-                port_to_upstream_name.setdefault(
-                    worker.listener_port_map[listener_type], worker.base_name
-                )
-                # The listener type
-                port_to_listener_type.setdefault(
-                    worker.listener_port_map[listener_type], listener_type
-                )
-                # And the list of roles this(possibly combination) worker can fill
-                self.upstreams_roles.setdefault(worker.base_name, set()).update(
-                    worker.types_list
-                )
+            for pattern in worker.endpoint_patterns:
+                # Collect port numbers for this endpoint pattern
+                locations_to_port_set.setdefault(pattern, set()).add(worker.main_port)
+
+            # Set lookup maps to be used for combining upstreams in a moment.
+            # Need the worker's base name
+            port_to_upstream_name.setdefault(worker.main_port, worker.base_name)
+
+            # And the list of roles this(possibly combination) worker can fill
+            self.upstreams_roles.setdefault(worker.base_name, set()).update(
+                worker.types_list
+            )
 
         for endpoint_pattern, port_set in locations_to_port_set.items():
             # Reset these for each run
@@ -788,8 +948,7 @@ class NginxConfig:
             for each_port in port_set:
                 # Get the worker.base_name for the upstream name
                 new_nginx_upstream_set.add(port_to_upstream_name[each_port])
-                # Get the listener_type, as it's appended to the upstream name
-                new_nginx_upstream_listener_set.add(port_to_listener_type[each_port])
+
                 # Get the workers roles for specialized load-balancing
                 new_nginx_upstream_roles.update(
                     self.upstreams_roles[port_to_upstream_name[each_port]]
@@ -797,9 +956,6 @@ class NginxConfig:
 
             # This will be the name of the upstream
             new_nginx_upstream = f"{'-'.join(sorted(new_nginx_upstream_set))}"
-            new_nginx_upstream += (
-                f".{'-'.join(sorted(new_nginx_upstream_listener_set))}"
-            )
 
             # Check this upstream exists, if not then make it
             if new_nginx_upstream not in self.upstreams_to_ports:
@@ -859,6 +1015,7 @@ def convert(src: str, dst: str, mode: str = "a", **template_vars: object) -> Non
         outfile.write("\n")
 
         outfile.write(rendered)
+        outfile.write("\n")
 
 
 def getenv_bool(name: str, default: bool = False) -> bool:
@@ -869,7 +1026,7 @@ def add_worker_roles_to_shared_config(
     shared_config: dict,
     worker_type_list: list,
     worker_name: str,
-    worker_ports: Dict[str, int],
+    worker_port: int,
     use_unix_socket: bool = False,
 ) -> None:
     """Given a dictionary representing a config file shared across all workers,
@@ -881,8 +1038,7 @@ def add_worker_roles_to_shared_config(
         worker_type_list: The type of worker (one of those defined in WORKERS_CONFIG).
             This list can be a single worker type or multiple.
         worker_name: The name of the worker instance.
-        worker_ports: The dict of ports to find the HTTP replication port that the
-            worker instance is listening on.
+        worker_port: The replication port that the worker instance is listening on.
         use_unix_socket: If a socket path should be used instead of a host/port combo
     """
     # The instance_map config field marks the workers that write to various replication
@@ -926,18 +1082,24 @@ def add_worker_roles_to_shared_config(
                 worker, []
             ).append(worker_name)
 
-        if "replication" in worker_ports.keys():
+        if "replication" in WORKERS_CONFIG.get(worker, {}).get(
+            "listener_resources", []
+        ):
             # Map of worker instance names to path or host/ports combos. If a worker
             # type in WORKERS_CONFIG needs to be added here in the future, just add a
             # 'replication' entry to the list in listener_resources for that worker.
+            # NOTE: in theory, the worker_port could be a 0 but that should not be the case
+            # as if a 'replication' listener is defined then this will be populated by the
+            # counter system
+            assert worker_port > 0
             if use_unix_socket:
                 instance_map[worker_name] = {
-                    "path": f"/run/worker.{worker_ports['replication']}",
+                    "path": f"/run/worker.{worker_port}",
                 }
             else:
                 instance_map[worker_name] = {
                     "host": "localhost",
-                    "port": worker_ports["replication"],
+                    "port": worker_port,
                 }
 
 
@@ -1053,10 +1215,6 @@ def generate_base_homeserver_config() -> None:
     # note that this script is copied in from the official, monolith dockerfile
     if "SYNAPSE_HTTP_PORT" not in os.environ:
         os.environ["SYNAPSE_HTTP_PORT"] = str(MAIN_PROCESS_HTTP_LISTENER_PORT)
-    if "SYNAPSE_METRICS_HTTP_PORT" not in os.environ:
-        os.environ["SYNAPSE_METRICS_HTTP_PORT"] = str(
-            MAIN_PROCESS_HTTP_METRICS_LISTENER_PORT
-        )
     subprocess.run(["/usr/local/bin/python", "/start.py", "migrate_config"], check=True)
 
 
@@ -1083,6 +1241,7 @@ def generate_worker_files(
     # pass through global variables for the add-ons
     # the auto compressor is taken care of in main
     global enable_prometheus
+    global enable_metric_endpoints
     global enable_redis_exporter
     enable_manhole_master = getenv_bool("SYNAPSE_MANHOLE_MASTER", False)
     enable_manhole_workers = getenv_bool("SYNAPSE_MANHOLE_WORKERS", False)
@@ -1474,7 +1633,9 @@ def generate_worker_files(
         # worker_type is a string that can be:
         # 1. a single worker type
         # 2. a combination of worker types, concatenated with a '+'
-        # 3. possibly prepended with a name and a '='
+        # 3. a superset of worker types as a convenience. For instance, a client_reader worker
+        #    would actually be a 'client_reader_non_room+client_reader_room'
+        # 4. possibly prepended with a name and a '='
         # Make the worker from that string.
         new_worker_name = workers.add_worker(worker_type)
 
@@ -1486,19 +1647,23 @@ def generate_worker_files(
 
         # If metrics is enabled, add a listener_resource for that
         if enable_metrics:
-            worker.listener_resources.add("metrics")
+            worker.metrics_port = workers.get_next_port_number()
 
         # Same for manholes
         if enable_manhole_workers:
-            worker.listener_resources.add("manhole")
+            worker.manhole_port = workers.get_next_port_number()
 
         # All workers get a health listener
-        worker.listener_resources.add("health")
+        worker.health_port = workers.get_next_port_number()
 
-        # Add in ports for each listener entry(e.g. 'client', 'federation', 'media',
-        # 'replication')
-        for listener_entry in worker.listener_resources:
-            workers.set_listener_port_by_resource(new_worker_name, listener_entry)
+        if "replication" in worker.listener_resources:
+            worker.replication_port = workers.get_next_port_number()
+            # Make sure to remove this one, don't need a double dip on port numbers
+            worker.listener_resources.discard("replication")
+
+        # Add in one port for all listener entries(e.g. 'client', 'federation', 'media')
+        if worker.listener_resources:
+            worker.main_port = workers.get_next_port_number()
 
         # Every worker gets a separate port or socket path to handle it's 'health'
         # resource. Append it to the list so docker can check it.
@@ -1507,14 +1672,12 @@ def generate_worker_files(
             # individualize the name of the file. We should never have to reference
             # these sockets directly, as that is what Nginx is doing for us.
             healthcheck_urls.append(
-                f"--unix-socket /run/worker.{worker.listener_port_map['health']} "
+                f"--unix-socket /run/worker.{worker.health_port} "
                 # Of the below URL, only the path is actually used, the rest is ignored.
                 "http://localhost/health"
             )
         else:
-            healthcheck_urls.append(
-                f"http://localhost:{worker.listener_port_map['health']}/health"
-            )
+            healthcheck_urls.append(f"http://localhost:{worker.health_port}/health")
 
         # Prepare the bits that will be used in the worker.yaml file
         worker_config = worker.extract_jinja_worker_template()
@@ -1527,12 +1690,12 @@ def generate_worker_files(
         )
 
         # Update the shared config with sharding-related options if any are found in the
-        # global shared_config.
+        # global shared_config. Recall that the port passed in should be for replication
         add_worker_roles_to_shared_config(
             shared_config,
             worker.types_list,
             new_worker_name,
-            worker.listener_port_map,
+            worker.replication_port,
             use_unix_socket=enable_replication_unix_sockets,
         )
 
@@ -1544,68 +1707,69 @@ def generate_worker_files(
         log_config_filepath = generate_worker_log_config(environ, worker.name, data_dir)
 
         # Build the worker_listener block for the worker.yaml
+        # TODO: worker_listeners should be a List, not a JsonDict. Fix
         worker_listeners: Dict[str, Any] = {}
-        for listener in worker.listener_resources:
-            this_listener: Dict[str, Any] = {}
-            if listener in HTTP_BASED_LISTENER_RESOURCES:
-                if listener in ["replication"]:
-                    this_listener = construct_worker_listener_block(
-                        worker.listener_port_map[listener],
-                        [listener],
-                        enable_replication_unix_sockets,
-                        False,
-                    )
-                elif listener in [
-                    "client",
-                    "federation",
-                    "media",
-                ]:
-                    this_listener = construct_worker_listener_block(
-                        worker.listener_port_map[listener],
-                        [listener],
-                        enable_public_unix_sockets,
-                        True,
-                    )
-                elif listener in ["health"]:
-                    this_listener = construct_worker_listener_block(
-                        worker.listener_port_map[listener],
-                        [listener],
-                        (enable_public_unix_sockets or enable_replication_unix_sockets),
-                        False,
-                    )
-                else:
-                    # This should be dead code now
-                    this_listener = construct_worker_listener_block(
-                        worker.listener_port_map[listener], [listener], False, True
-                    )
-            elif listener in ["metrics"]:
-                # Metrics listeners are a strange sort, supporting both 'http' and a
-                # custom 'metrics' type. The 'http' type allows for compression and unix
-                # sockets, but at the expense of utiltizing the reactor to generate
-                # results(causing a delay in response).
-                # However, using the custom 'metrics' type allows a side-loaded
-                # webserver to handle the load of generating results, allowing for a
-                # much snappier response time. Unless we are trying to use Unix sockets,
-                # just use the custom type.
-                # Note: at this time, Prometheus does not support Unix sockets.
-                if enable_metrics_unix_socket:
-                    this_listener = construct_worker_listener_block(
-                        worker.listener_port_map[listener],
-                        [listener],
-                        enable_metrics_unix_socket,
-                        True,
-                    )
-                else:
-                    this_listener = {
-                        "type": listener,
-                        "port": worker.listener_port_map[listener],
-                    }
-            # The 'manhole' listener doesn't use 'http' as its type.
-            elif listener in ["manhole"]:
+        if worker.listener_resources:
+            this_listener = construct_worker_listener_block(
+                worker.main_port,
+                list(worker.listener_resources),
+                enable_public_unix_sockets,
+                True,
+            )
+
+            worker_listeners.setdefault("worker_listeners", []).append(this_listener)
+
+        if worker.replication_port > 0:
+            this_listener = construct_worker_listener_block(
+                worker.replication_port,
+                ["replication"],
+                enable_replication_unix_sockets,
+                False,
+            )
+            worker_listeners.setdefault("worker_listeners", []).append(this_listener)
+
+        # Then do the health and metrics(if applicable)
+        if worker.health_port > 0:
+            this_listener = construct_worker_listener_block(
+                worker.health_port,
+                ["health"],
+                (enable_public_unix_sockets or enable_replication_unix_sockets),
+                False,
+            )
+            worker_listeners.setdefault("worker_listeners", []).append(this_listener)
+
+        # The 'manhole' listener doesn't use 'http' as its type.
+        if worker.manhole_port > 0:
+            this_listener = {
+                "type": "manhole",
+                "port": worker.manhole_port,
+            }
+            worker_listeners.setdefault("worker_listeners", []).append(this_listener)
+
+        if worker.metrics_port > 0:
+            # Metrics listeners are a strange sort, supporting both 'http' and a
+            # custom 'metrics' type. The 'http' type allows for compression and unix
+            # sockets, but at the expense of utilising the reactor to generate
+            # results(causing a delay in response).
+            # However, using the custom 'metrics' type allows a side-loaded
+            # webserver to handle the load of generating results, allowing for a
+            # much snappier response time. Unless we are trying to use Unix sockets,
+            # just use the custom type.
+            # Note: at this time, Prometheus does not support Unix sockets.
+            if enable_metrics_unix_socket:
+                this_listener = construct_worker_listener_block(
+                    worker.metrics_port,
+                    ["metrics"],
+                    enable_metrics_unix_socket,
+                    True,
+                )
+
+            else:
                 this_listener = {
-                    "type": listener,
-                    "port": worker.listener_port_map[listener],
+                    "type": "metrics",
+                    "port": worker.metrics_port,
                 }
+
             worker_listeners.setdefault("worker_listeners", []).append(this_listener)
 
         # That's everything needed to construct the worker config file.
@@ -1633,6 +1797,8 @@ def generate_worker_files(
         "keepalive_connection_multiplier": int(
             os.environ.get("NGINX_UPSTREAM_KEEPALIVE_CONNECTION_MULTIPLIER", 1)
         ),
+        "server_max_fails": int(os.environ.get("NGINX_UPSTREAM_SERVER_MAX_FAILS", 1)),
+        "server_fail_timeout": int(os.environ.get("NGINX_UPSTREAM_SERVER_FAIL_TIMEOUT", 10))
     }
 
     # There are now two dicts to pull data from to construct the nginx config files.
@@ -1655,71 +1821,28 @@ def generate_worker_files(
     # Determine the load-balancing upstreams to configure
     nginx_upstream_config = ""
 
-    # lb stands for load-balancing. These can be added to if other worker roles are
-    # appropriate. Based on the Docs, this is it.
-    roles_lb_header_list = ["synchrotron"]
-    roles_lb_ip_list = ["federation_inbound"]
-    roles_lb_room_name: List[str] = ["client_reader"]
-
     # Keep a tally of what workers will care about having a larger hash table for nginx.
     # The main process counts as 1, so start the tally there.
     count_of_hash_requiring_workers = 1
+
+    upstream_server_fail_configs = f" max_fails={nginx_upstreams_config_dict['server_max_fails']}"
+    upstream_server_fail_configs += f" fail_timeout={nginx_upstreams_config_dict['server_fail_timeout']}"
     for upstream_name, upstream_worker_ports in nginx.upstreams_to_ports.items():
-        body = ""
         roles_list = nginx.upstreams_roles[upstream_name]
 
-        # This presents a dilemma. Some endpoints are better load-balanced by
-        # Authorization header, and some by remote IP. What do you do if a combo
-        # worker was requested that has endpoints for both? As it is likely but
-        # not impossible that a user will be on the same IP if they have multiple
-        # devices(like at home on Wi-Fi), I believe that balancing by IP would be
-        # the broader reaching choice. This is probably only slightly better than
-        # round-robin. As such, leave balancing by remote IP as the first of the
-        # conditionals below, so if both would apply the first is used.
-
-        # Three additional notes:
-        #   1. Federation endpoints shouldn't (necessarily) have Authorization
-        #       headers, so using them on these endpoints would be a moot point.
-        #   2. For Complement, this situation is reversed as there is only ever a
-        #       single IP used during tests, 127.0.0.1.
-        #   3. IIRC, it may be possible to hash by both at once, or at least have
-        #       both hashes on the same line. If I understand that correctly, the
-        #       one that doesn't exist is effectively ignored. However, that
-        #       requires increasing the hashmap size in the nginx master config
-        #       file, which would take more jinja templating(or at least a 'sed'),
-        #       and may not be accepted upstream. Based on previous experiments,
-        #       increasing this value was required for hashing by room id, so may
-        #       end up being a path forward anyway.
-
-        # Some endpoints should be load-balanced by client IP. This way,
-        # if it comes from the same IP, it goes to the same worker and should be
-        # a smarter way to cache data. This works well for federation.
-        if any(x in roles_lb_ip_list for x in roles_list):
-            body += "    hash $proxy_add_x_forwarded_for;\n"
-            count_of_hash_requiring_workers += 1
-
-        # Some endpoints should be load-balanced by Authorization header. This
-        # means that even with a different IP, a user should get the same data
-        # from the same upstream source, like a synchrotron worker, with smarter
-        # caching of data.
-        elif any(x in roles_lb_header_list for x in roles_list):
-            body += "    hash $user_id consistent;\n"
-            count_of_hash_requiring_workers += 1
-
-        # Some endpoints cache better when the request uri with a room name is
-        # consistently mapped to the same worker. A `map` has been placed inside
-        # synapse-nginx.conf.j2 that this will reference.
-        elif any(x in roles_lb_room_name for x in roles_list):
-            body += "    hash $room_name consistent;\n"
-            count_of_hash_requiring_workers += 1
+        # This will add an appropriate "hash" and type of hash(or nothing if round-robin is being used)
+        # and also increment the counter for multiplying the nginx hash map max size
+        body = add_hash_to_body_if_need_load_balance(roles_list, count_of_hash_requiring_workers)
 
         # Add specific "hosts" by port number to the upstream block. In the case of Unix
-        # sockets, borrow the port number to individualize the socket files.
+        # sockets, borrow the port number to individualize the socket files. Using `max_fails=0` so
+        # if an upstream doesn't response within it's timeout it doesn't get marked as "dead" and
+        # routed around by accident
         for port in upstream_worker_ports:
             if enable_public_unix_sockets:
-                body += f"    server unix:/run/worker.{port};\n"
+                body += f"    server unix:/run/worker.{port}{upstream_server_fail_configs};\n"
             else:
-                body += f"    server localhost:{port};\n"
+                body += f"    server localhost:{port}{upstream_server_fail_configs};\n"
 
         if nginx_upstreams_config_dict["keepalive_global_enable"]:
             # Need this to determine keepalive argument, need multiple of 2. Double the
@@ -1895,31 +2018,63 @@ def generate_worker_files(
 
     # Prometheus config, if enabled
     # Set up the metric end point locations, names and indexes
+    # Run this no matter what, need to establish the data for supervisor
+    prom_config = PromConfig()
     if enable_prometheus:
-        prom_endpoint_config = ""
-        for _, worker in workers.worker.items():
-            worker_portpath_target_number = worker.listener_port_map["metrics"]
-            metrics_target = (
-                f"/run/worker.{worker_portpath_target_number}"
-                if enable_metrics_unix_socket
-                else f"127.0.0.1:{worker_portpath_target_number}"
-            )
-            prom_endpoint_config += PROMETHEUS_SCRAPE_CONFIG_BLOCK.format(
-                name=worker.base_name,
-                metrics_target=metrics_target,
-                index=str(worker.index),
-            )
+
         main_process_target = (
             f"{MAIN_PROCESS_NEW_METRICS_UNIX_SOCKET_PATH}"
             if enable_metrics_unix_socket
             else f"localhost:{MAIN_PROCESS_HTTP_METRICS_LISTENER_PORT}"
         )
+
+        prom_target_json = [{
+            "targets": [main_process_target],
+            "labels": {
+                "instance": prom_config.instance_name,
+                "job": "main process",
+                "index": "1",
+            }
+        }]
+
+        for _, worker in workers.worker.items():
+            worker_portpath_target_number = worker.metrics_port
+            metrics_target = (
+                f"/run/worker.{worker_portpath_target_number}"
+                if enable_metrics_unix_socket
+                else f"127.0.0.1:{worker_portpath_target_number}"
+            )
+            prom_target_json.append(
+                {
+                    "targets": [metrics_target],
+                    "labels": {
+                        "instance": prom_config.instance_name,
+                        "job": worker.base_name,
+                        "index": str(worker.index),
+                    }
+                }
+            )
+        prom_target_json_done = json.dumps(prom_target_json, indent=4)
+
+        config_dir = os.environ.get("SYNAPSE_CONFIG_DIR", "/data")
+        # Make a subdirectory. Prometheus does a 'file watch' on the target.json file,
+        # but the docs say it will watch the parent directory too. Limit that scope
+        prom_target_dir = config_dir + "/prom_targets"
+
+        # It's not executable, but it should be read/write accessible
+        os.makedirs(prom_target_dir, 0x666, exist_ok=True)
+        prom_config.file_sd_targets_file = f"{prom_target_dir}/target.json"
+
+        # Use mode "w" here to always overwrite the file
+        with open(prom_config.file_sd_targets_file, "w") as outfile:
+            outfile.write(prom_target_json_done)
+            outfile.write("\n")
+
         convert(
             "/conf/prometheus.yml.j2",
             "/etc/prometheus/prometheus.yml",
-            main_process_target=main_process_target,
-            metric_endpoint_locations=prom_endpoint_config,
             metric_scrape_interval=os.environ.get("PROMETHEUS_SCRAPE_INTERVAL", "15s"),
+            prom_config=prom_config,
         )
 
     # Supervisord config
@@ -1934,7 +2089,7 @@ def generate_worker_files(
         enable_prometheus=enable_prometheus,
         enable_compressor=enable_compressor,
         enable_coturn=enable_coturn,
-        prometheus_storage_retention_time=prometheus_storage_retention_time
+        prometheus_storage_retention_time=prom_config.storage_retention_time,
     )
 
     convert(
@@ -1997,15 +2152,22 @@ def main(args: List[str], environ: MutableMapping[str, str]) -> None:
     global enable_compressor
     global enable_coturn
     global enable_prometheus
+    global enable_metric_endpoints
     global enable_redis_exporter
     global enable_postgres_exporter
-    global prometheus_storage_retention_time
     enable_compressor = (
         getenv_bool("SYNAPSE_ENABLE_COMPRESSOR", False)
         and "POSTGRES_PASSWORD" in environ
     )
     enable_coturn = getenv_bool("SYNAPSE_ENABLE_BUILTIN_COTURN", False)
     enable_prometheus = getenv_bool("SYNAPSE_METRICS", False)
+    enable_metric_endpoints = getenv_bool("SYNAPSE_METRICS_ENABLE_LISTENERS", True if enable_prometheus else False)
+    if enable_metric_endpoints:
+        # This is forced so it will be picked up when generate_base_homeserver_config() is called
+        os.environ["SYNAPSE_METRICS_HTTP_PORT"] = str(
+            MAIN_PROCESS_HTTP_METRICS_LISTENER_PORT
+        )
+
     enable_redis_exporter = (
         getenv_bool("SYNAPSE_ENABLE_REDIS_METRIC_EXPORT", False)
         and enable_prometheus is True
@@ -2014,7 +2176,6 @@ def main(args: List[str], environ: MutableMapping[str, str]) -> None:
         getenv_bool("SYNAPSE_ENABLE_POSTGRES_METRIC_EXPORT", False)
         and "POSTGRES_PASSWORD" in environ
     )
-    prometheus_storage_retention_time = str(os.getenv("PROMETHEUS_STORAGE_RETENTION_TIME", "1y"))
 
     disable_nginx_logrotate = getenv_bool("NGINX_DISABLE_LOGROTATE", False)
 
